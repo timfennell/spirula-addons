@@ -1,4 +1,4 @@
-From 090e3245d4b9e04ea5e9bbd55a633e7e7e21a7c6 Mon Sep 17 00:00:00 2001
+From 2943b4ef45f411487b79742dc95e6ea06a6906de Mon Sep 17 00:00:00 2001
 From: Tim Fennell <2501251+timfennell@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 10:07:59 -0500
 Subject: [PATCH] Insect voids: cross-section void editor, and voids that block
@@ -41,7 +41,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/app/TrainerCore.h                         |   1 +
  src/app/gui/GuiApp.cpp                        |   4 +
  src/app/gui/GuiApp.h                          |   7 +
- src/app/gui/KeepOutPanel.cpp                  | 165 +++++
+ src/app/gui/KeepOutPanel.cpp                  | 166 +++++
  src/app/gui/Ui.h                              |   3 +
  src/app/gui/VoidEditor.cpp                    | 408 +++++++++++++
  src/app/gui/VoidEditor.h                      |  60 ++
@@ -61,7 +61,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/engine/EngineTrainStep.cpp                |  46 ++
  src/i18n/catalog/Log.h                        |  27 +
  src/i18n/catalog/TrainFields.h                |  60 ++
- 25 files changed, 1891 insertions(+), 5 deletions(-)
+ 25 files changed, 1892 insertions(+), 5 deletions(-)
  create mode 100644 docs/notes/insect-voids.md
  create mode 100644 src/app/gui/KeepOutPanel.cpp
  create mode 100644 src/app/gui/VoidEditor.cpp
@@ -363,10 +363,10 @@ index e63551c6..d76f17ae 100644
      PresetPicker<TrainPreset> _train_presets;
 diff --git a/src/app/gui/KeepOutPanel.cpp b/src/app/gui/KeepOutPanel.cpp
 new file mode 100644
-index 00000000..7762f7d4
+index 00000000..5f76b444
 --- /dev/null
 +++ b/src/app/gui/KeepOutPanel.cpp
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,166 @@
 +// KeepOutPanel.cpp -- the trainer screen's "Keep-out regions (insects)"
 +// section (GuiApp::draw_keep_out_panel): the cross-section void editor, which
 +// region to keep splats out of, whether its voids also block light, and
@@ -473,7 +473,8 @@ index 00000000..7762f7d4
 +        if (paused) {
 +            // The model as it is now, written where the run keeps its checkpoints.
 +            std::lock_guard<std::mutex> lk(s->engine_mutex);
-+            s->save_checkpoint(s->cur_step.load());
++            s->save_checkpoint(s->cur_step.load(),
++                               s->cfg.save_full_checkpoint || s->cfg.save_only_latest_checkpoint);
 +            ply = s->out_dir.string();
 +        } else if (ph == TrainRunner::Phase::Done) {
 +            ply = s->out_dir.string();
