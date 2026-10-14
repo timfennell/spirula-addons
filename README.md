@@ -15,8 +15,18 @@ camera rig. Each one installs on its own; pick one, or both.
 
 ## Installing
 
-The add-ons are source patches. You apply them to a clone of Spirula Studio,
-then build it as usual. They're made against upstream `master` at
+**Easiest:** clone a ready-made branch of Spirula with the add-ons already in
+it, from [timfennell/spirula-studio](https://github.com/timfennell/spirula-studio),
+then build it as usual:
+
+```bash
+git clone -b insect-tools https://github.com/timfennell/spirula-studio      # both add-ons
+git clone -b training-capture https://github.com/timfennell/spirula-studio  # capture only
+git clone -b insect-voids https://github.com/timfennell/spirula-studio      # voids only
+```
+
+**Or patch your own clone.** The add-ons are also plain source patches you
+can apply to a clone of Spirula Studio. They're made against upstream `master` at
 [`d6d0d855`](https://github.com/harry7557558/spirula-studio/commit/d6d0d855)
 (2026-10-14).
 
