@@ -1,0 +1,982 @@
+From 9afbf230fcce5ccab4d75d93a89560d2cb9c587d Mon Sep 17 00:00:00 2001
+From: Tim Fennell <2501251+timfennell@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:23:20 -0500
+Subject: [PATCH] Training animation capture: record the model while it trains
+
+A "Training animation capture" panel on the trainer screen renders the
+model on the training thread between steps, from cameras of its own, so the
+live preview is untouched: fixed training views, an arc through several
+views (position, up and look-at target interpolated, so it stays on the
+subject), and/or an orbit about the scene, several tracks at once.
+
+Frames go to <run>/captures/<track>/ as PNG sequences (HD, 2K or 4K, RGBA
+or over black) and/or H.264/H.265 video piped to ffmpeg; frames.csv maps
+frames to steps. A frame every N steps, five times as often at the start.
+It reuses the trainer's forward, so it costs about 10 MB of GPU memory and
+0.37 s per 4K frame on an M2 Pro; encoding runs on writer threads.
+
+See docs/notes/training-capture.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/notes/training-capture.md    |  37 +++
+ src/app/gui/GuiApp.cpp            |   6 +
+ src/app/gui/GuiApp.h              |   3 +
+ src/app/gui/TrainCapture.cpp      | 453 ++++++++++++++++++++++++++++++
+ src/app/gui/TrainCapture.h        |  97 +++++++
+ src/app/gui/TrainCapturePanel.cpp | 159 +++++++++++
+ src/app/gui/TrainRunner.cpp       |   6 +-
+ src/app/gui/TrainRunner.h         |   6 +
+ src/app/gui/Ui.h                  |   3 +
+ src/engine/Engine.h               |   3 +
+ src/engine/EngineForward.cpp      |   6 +
+ 11 files changed, 778 insertions(+), 1 deletion(-)
+ create mode 100644 docs/notes/training-capture.md
+ create mode 100644 src/app/gui/TrainCapture.cpp
+ create mode 100644 src/app/gui/TrainCapture.h
+ create mode 100644 src/app/gui/TrainCapturePanel.cpp
+
+diff --git a/docs/notes/training-capture.md b/docs/notes/training-capture.md
+new file mode 100644
+index 00000000..4cc5312b
+--- /dev/null
++++ b/docs/notes/training-capture.md
+@@ -0,0 +1,37 @@
++# Training animation capture
++
++The trainer's **Training animation capture** panel records the model as it
++trains, from cameras of its own, without touching the live preview
++(`app/gui/TrainCapture.h`).
++
++## Tracks
++
++Any number at once, each to `<run>/captures/<track>/`:
++
++- **Fixed views** -- one track per chosen training image, from that camera.
++- **Arc** -- a path through two or more training views in order. Position, up
++  vector and look-at target are interpolated between keyframes, so the camera
++  stays on the subject instead of drifting with the cameras' own aim.
++- **Orbit** -- a turn of `orbit_degrees` about the scene centre, starting at
++  one training view, about the cameras' mean up.
++
++A track's frames are spread over the run: frame k of n sits at u = k/(n-1)
++along the arc or orbit, so the motion and the training finish together.
++
++## Schedule and output
++
++A frame every `every_steps` steps, five times as often over the first ten
++intervals (`dense_start`), where the model changes most. HD, 2K or 4K. Output
++is PNG frames (RGBA over nothing, or RGB over black), a video, or both. Video
++is piped to ffmpeg (`render::open_pipe_sink`) as H.264 or H.265 at three
++quality levels; a 4K H.265 sequence is about 250x smaller than its PNGs.
++`frames.csv` maps each frame to its step.
++
++## Cost
++
++Frames are rendered on the training thread between steps, through the same
++forward the trainer uses (`set_camera_params`, `forward_3dgs`,
++`engine_copy_render_to_host`), so no second copy of the model exists on the
++device; measured about 10 MB of extra GPU memory and 0.37 s per 4K frame on an
++M2 Pro. PNG encoding and the ffmpeg pipe run on writer threads, off the
++training thread. Settings persist in `gui.conf` as `capture_*` keys.
+diff --git a/src/app/gui/GuiApp.cpp b/src/app/gui/GuiApp.cpp
+index 1403d54d..caa9d2e8 100644
+--- a/src/app/gui/GuiApp.cpp
++++ b/src/app/gui/GuiApp.cpp
+@@ -439,6 +439,7 @@ void GuiApp::load_settings() {
+         // default, which is ON: the files are what makes a run resumable.
+         else if (k == "keep_intermediate") _sfm_job.keep_intermediate = v != "0";
+         else if (k == "save_full_checkpoint") _keep_full_ckpt = v != "0";
++        else if (k.rfind("capture_", 0) == 0) read_capture_setting(_capture, k, v);
+         else if (k.rfind(kDirPrefix, 0) == 0 && !v.empty())
+             _dialog_dirs[k.substr(sizeof kDirPrefix - 1)] = v;
+         else if (read_screenshot_setting(_shot, k, v)) {}
+@@ -488,6 +489,7 @@ void GuiApp::save_settings() {
+     std::fprintf(f, "native_dialogs=%d\n", _dialog.native_enabled() ? 1 : 0);
+     std::fprintf(f, "keep_intermediate=%d\n", _sfm_job.keep_intermediate ? 1 : 0);
+     std::fprintf(f, "save_full_checkpoint=%d\n", _keep_full_ckpt ? 1 : 0);
++    write_capture_settings(f, _capture);
+     for (const auto& [key, dir] : _dialog_dirs)
+         std::fprintf(f, "%s%s=%s\n", kDirPrefix, key.c_str(), dir.c_str());
+     write_screenshot_settings(f, _shot);
+@@ -1385,6 +1387,8 @@ void GuiApp::launch_training(const TrainConfig& cfg, const std::string& preset)
+     open_run_log(_train_log, data_dir, "train", run_log_stamp());
+     set_ss_env("UNREG_LOG", "");
+     write_run_settings(_train_log);
++    _capture.ffmpeg = _ffmpeg_exe.empty() ? std::string("ffmpeg") : _ffmpeg_exe;
++    _runner.set_capture(_capture);
+     _runner.start_training(cfg, preset);
+ }
+ 
+@@ -10446,6 +10450,8 @@ void GuiApp::draw_train_settings() {
+         if (!parse_settings_equal(parse_before, _cfg)) _parse_dirty = true;
+     }
+ 
++    draw_capture_panel();
++
+     // ---- controls + metrics ----
+     ui::SeparatorText(msg::section_training);
+     draw_train_controls();
+diff --git a/src/app/gui/GuiApp.h b/src/app/gui/GuiApp.h
+index e63551c6..c0a31413 100644
+--- a/src/app/gui/GuiApp.h
++++ b/src/app/gui/GuiApp.h
+@@ -617,6 +617,7 @@ private:
+     void draw_preset_delete_modal();
+     void draw_basic_options();
+     void draw_train_controls();
++    void draw_capture_panel();
+     void draw_metrics();
+     void draw_status_strip();
+     // Right-aligned VRAM readout on the status strip; x0/avail describe the
+@@ -757,6 +758,8 @@ private:
+     bool _keep_full_ckpt = false;
+     ScreenshotSettings _shot;
+     std::vector<std::future<std::string>> _shot_jobs;   // path written, or throws
++    CaptureSettings _capture;
++    std::string _capture_filter;
+ 
+     // Saved presets, one picker per kind.
+     PresetPicker<TrainPreset> _train_presets;
+diff --git a/src/app/gui/TrainCapture.cpp b/src/app/gui/TrainCapture.cpp
+new file mode 100644
+index 00000000..1094f1c2
+--- /dev/null
++++ b/src/app/gui/TrainCapture.cpp
+@@ -0,0 +1,453 @@
++// TrainCapture.cpp -- see TrainCapture.h.
++
++#include "app/gui/TrainCapture.h"
++
++#include "app/TrainerCore.h"
++#include "app/gui/render/FrameSink.h"
++#include "core/Camera.h"
++#include "engine/Engine.h"
++#include "external/stb_image_write.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++
++namespace fs = std::filesystem;
++
++namespace gui {
++
++namespace {
++
++TorchTensorView tvp(const void* p, uint32_t elem_size, std::vector<int64_t> shape) {
++    return {(uint64_t)(uintptr_t)p, elem_size, std::move(shape)};
++}
++TorchTensorView tv_null() { return {0, 0, {}}; }
++
++void cross(const float a[3], const float b[3], float o[3]) {
++    o[0] = a[1] * b[2] - a[2] * b[1];
++    o[1] = a[2] * b[0] - a[0] * b[2];
++    o[2] = a[0] * b[1] - a[1] * b[0];
++}
++float norm3(const float a[3]) { return std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); }
++void normalize3(float a[3]) {
++    const float n = norm3(a);
++    if (n > 1e-12f) for (int i = 0; i < 3; i++) a[i] /= n;
++}
++void transpose3(const float a[9], float o[9]) {
++    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) o[c * 3 + r] = a[r * 3 + c];
++}
++void matmul3(const float a[9], const float b[9], float o[9]) {
++    for (int r = 0; r < 3; r++)
++        for (int c = 0; c < 3; c++)
++            o[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
++}
++void rot_axis(const float axis[3], float th, float o[9]) {
++    const float c = std::cos(th), s = std::sin(th), t = 1 - c;
++    const float x = axis[0], y = axis[1], z = axis[2];
++    const float m[9] = {t * x * x + c,     t * x * y - s * z, t * x * z + s * y,
++                        t * x * y + s * z, t * y * y + c,     t * y * z - s * x,
++                        t * x * z - s * y, t * y * z + s * x, t * z * z + c};
++    std::copy(m, m + 9, o);
++}
++
++void slerp(const double a[4], const double b_in[4], double t, double o[4]) {
++    double b[4] = {b_in[0], b_in[1], b_in[2], b_in[3]};
++    double d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
++    if (d < 0) { for (double& v : b) v = -v; d = -d; }
++    double wa = 1 - t, wb = t;
++    if (d < 0.9995) {
++        const double th = std::acos(d), s = std::sin(th);
++        wa = std::sin((1 - t) * th) / s;
++        wb = std::sin(t * th) / s;
++    }
++    double n = 0;
++    for (int i = 0; i < 4; i++) { o[i] = wa * a[i] + wb * b[i]; n += o[i] * o[i]; }
++    n = std::sqrt(n);
++    for (int i = 0; i < 4; i++) o[i] /= n;
++}
++
++// Point nearest every camera's optical axis: where a turntable capture aims.
++void axes_focus(const PostSplitCameras& post, float out[3]) {
++    double A[9] = {0}, b[3] = {0};
++    for (int64_t p = 0; p < post.n_post; p++) {
++        const float* vm = &post.viewmats[(size_t)p * 16];
++        const float R[9] = {vm[0], vm[1], vm[2], vm[4], vm[5], vm[6], vm[8], vm[9], vm[10]};
++        const float t[3] = {vm[3], vm[7], vm[11]};
++        double C[3], d[3] = {R[6], R[7], R[8]};
++        for (int i = 0; i < 3; i++) C[i] = -(R[i] * t[0] + R[3 + i] * t[1] + R[6 + i] * t[2]);
++        for (int r = 0; r < 3; r++)
++            for (int c = 0; c < 3; c++) {
++                const double m = (r == c ? 1.0 : 0.0) - d[r] * d[c];
++                A[r * 3 + c] += m;
++                b[r] += m * C[c];
++            }
++    }
++    const double det = A[0] * (A[4] * A[8] - A[5] * A[7]) - A[1] * (A[3] * A[8] - A[5] * A[6]) +
++                       A[2] * (A[3] * A[7] - A[4] * A[6]);
++    if (std::abs(det) < 1e-12) return;
++    const double inv[9] = {(A[4] * A[8] - A[5] * A[7]) / det, (A[2] * A[7] - A[1] * A[8]) / det,
++                           (A[1] * A[5] - A[2] * A[4]) / det, (A[5] * A[6] - A[3] * A[8]) / det,
++                           (A[0] * A[8] - A[2] * A[6]) / det, (A[2] * A[3] - A[0] * A[5]) / det,
++                           (A[3] * A[7] - A[4] * A[6]) / det, (A[1] * A[6] - A[0] * A[7]) / det,
++                           (A[0] * A[4] - A[1] * A[3]) / det};
++    for (int r = 0; r < 3; r++)
++        out[r] = (float)(inv[r * 3] * b[0] + inv[r * 3 + 1] * b[1] + inv[r * 3 + 2] * b[2]);
++}
++
++std::string safe_stem(const std::string& path) {
++    std::string s = fs::path(path).stem().string();
++    for (char& c : s)
++        if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '+')) c = '_';
++    return s;
++}
++
++}  // namespace
++
++
++void capture_frame_size(int resolution, int& W, int& H) {
++    switch (resolution) {
++        case 2:  W = 3840; H = 2160; break;
++        case 1:  W = 2560; H = 1440; break;
++        default: W = 1920; H = 1080; break;
++    }
++}
++
++std::vector<int> capture_schedule(const CaptureSettings& cs, int start, int total) {
++    std::vector<int> steps;
++    const int N = std::max(1, cs.every_steps);
++    const int dense = std::max(1, N / 5);
++    for (int st = start; st < total;) {
++        steps.push_back(st);
++        st += (cs.dense_start && st - start < 10 * N) ? dense : N;
++    }
++    if (total > start && steps.back() != total - 1) steps.push_back(total - 1);
++    return steps;
++}
++
++namespace {
++
++std::vector<std::string> split_names(const std::string& v) {
++    std::vector<std::string> out;
++    size_t a = 0;
++    while (a <= v.size()) {
++        const size_t b = v.find('|', a);
++        const std::string s = v.substr(a, b == std::string::npos ? std::string::npos : b - a);
++        if (!s.empty()) out.push_back(s);
++        if (b == std::string::npos) break;
++        a = b + 1;
++    }
++    return out;
++}
++std::string join_names(const std::vector<std::string>& v) {
++    std::string s;
++    for (const std::string& n : v) { if (!s.empty()) s += '|'; s += n; }
++    return s;
++}
++
++}  // namespace
++
++void read_capture_setting(CaptureSettings& cs, const std::string& k, const std::string& v) {
++    if (k == "capture_enabled") cs.enabled = v != "0";
++    else if (k == "capture_resolution") cs.resolution = std::clamp(std::atoi(v.c_str()), 0, 2);
++    else if (k == "capture_every") cs.every_steps = std::max(1, std::atoi(v.c_str()));
++    else if (k == "capture_dense") cs.dense_start = v != "0";
++    else if (k == "capture_transparent") cs.transparent = v != "0";
++    else if (k == "capture_fixed") cs.fixed_views = split_names(v);
++    else if (k == "capture_arc") cs.arc = v != "0";
++    else if (k == "capture_arc_views") cs.arc_views = split_names(v);
++    else if (k == "capture_orbit") cs.orbit = v != "0";
++    else if (k == "capture_orbit_view") cs.orbit_view = v;
++    else if (k == "capture_orbit_degrees") cs.orbit_degrees = (float)std::atof(v.c_str());
++    else if (k == "capture_output") cs.output = std::clamp(std::atoi(v.c_str()), 0, 2);
++    else if (k == "capture_codec") cs.codec = std::clamp(std::atoi(v.c_str()), 0, 1);
++    else if (k == "capture_quality") cs.quality = std::clamp(std::atoi(v.c_str()), 0, 2);
++    else if (k == "capture_fps") cs.fps = std::max(1.0f, (float)std::atof(v.c_str()));
++}
++
++void write_capture_settings(FILE* f, const CaptureSettings& cs) {
++    std::fprintf(f, "capture_enabled=%d\n", cs.enabled ? 1 : 0);
++    std::fprintf(f, "capture_resolution=%d\n", cs.resolution);
++    std::fprintf(f, "capture_every=%d\n", cs.every_steps);
++    std::fprintf(f, "capture_dense=%d\n", cs.dense_start ? 1 : 0);
++    std::fprintf(f, "capture_transparent=%d\n", cs.transparent ? 1 : 0);
++    std::fprintf(f, "capture_fixed=%s\n", join_names(cs.fixed_views).c_str());
++    std::fprintf(f, "capture_arc=%d\n", cs.arc ? 1 : 0);
++    std::fprintf(f, "capture_arc_views=%s\n", join_names(cs.arc_views).c_str());
++    std::fprintf(f, "capture_orbit=%d\n", cs.orbit ? 1 : 0);
++    std::fprintf(f, "capture_orbit_view=%s\n", cs.orbit_view.c_str());
++    std::fprintf(f, "capture_orbit_degrees=%.1f\n", cs.orbit_degrees);
++    std::fprintf(f, "capture_output=%d\n", cs.output);
++    std::fprintf(f, "capture_codec=%d\n", cs.codec);
++    std::fprintf(f, "capture_quality=%d\n", cs.quality);
++    std::fprintf(f, "capture_fps=%.2f\n", cs.fps);
++}
++
++TrainCapture::Pose TrainCapture::post_pose(const spirula::TrainerSession& s, int p) const {
++    const auto& post = s.post;
++    Pose o;
++    const float* vm = &post.viewmats[(size_t)p * 16];
++    const float R[9] = {vm[0], vm[1], vm[2], vm[4], vm[5], vm[6], vm[8], vm[9], vm[10]};
++    std::copy(R, R + 9, o.R);
++    for (int i = 0; i < 3; i++)
++        o.C[i] = -(R[i] * vm[3] + R[3 + i] * vm[7] + R[6 + i] * vm[11]);
++    for (int i = 0; i < 4; i++) o.intr[i] = post.intrins[(size_t)p * 4 + i];
++    o.w = post.post_widths[(size_t)p];
++    o.h = post.post_heights[(size_t)p];
++    o.model = camera_model_to_string((CameraModelType)post.post_models[(size_t)p]);
++    o.distortion = camera_distortion_to_string(
++        (CameraDistortionType)post.post_distortions[(size_t)p]);
++    for (int i = 0; i < 8; i++) o.dist[i] = post.dist_coeffs[(size_t)p * 8 + i];
++    return o;
++}
++
++TrainCapture::Pose TrainCapture::track_pose(const spirula::TrainerSession& s,
++                                            const Track& t, float u) const {
++    if (t.kind == 0) return post_pose(s, t.posts[0]);
++    if (t.kind == 2) {
++        Pose o = post_pose(s, t.posts[0]);
++        float Q[9], QT[9], R2[9];
++        rot_axis(_up, u * _cs.orbit_degrees * (float)M_PI / 180.0f, Q);
++        transpose3(Q, QT);
++        matmul3(o.R, QT, R2);
++        std::copy(R2, R2 + 9, o.R);
++        float d[3] = {o.C[0] - _center[0], o.C[1] - _center[1], o.C[2] - _center[2]};
++        for (int r = 0; r < 3; r++)
++            o.C[r] = _center[r] + Q[r * 3] * d[0] + Q[r * 3 + 1] * d[1] + Q[r * 3 + 2] * d[2];
++        o.distortion = "NONE";
++        return o;
++    }
++    // Arc: keyframes in order, swung around the focus point at lerped distance.
++    const int n = (int)t.posts.size();
++    const float f = std::clamp(u, 0.0f, 1.0f) * (float)(n - 1);
++    const int i = std::min((int)f, n - 2);
++    const float a = f - (float)i;
++    const Pose A = post_pose(s, t.posts[(size_t)i]), B = post_pose(s, t.posts[(size_t)i + 1]);
++    Pose o = A;
++    float da[3], db[3];
++    for (int k = 0; k < 3; k++) { da[k] = A.C[k] - _center[k]; db[k] = B.C[k] - _center[k]; }
++    const float la = norm3(da), lb = norm3(db);
++    double va[4] = {0, da[0], da[1], da[2]}, vb[4] = {0, db[0], db[1], db[2]};
++    // Direction slerp as a pure-vector quaternion: same great-circle arc.
++    for (int k = 1; k < 4; k++) { va[k] /= std::max(la, 1e-12f); vb[k] /= std::max(lb, 1e-12f); }
++    double v[4];
++    slerp(va, vb, a, v);
++    const float len = la + (lb - la) * a;
++    for (int k = 0; k < 3; k++) o.C[k] = _center[k] + (float)v[k + 1] * len;
++    // Aim at the lerp of each key's point nearest the focus, up lerped too:
++    // slerping the keys' rotations separately lets the subject leave frame.
++    auto aim = [&](const Pose& P, float T[3], float U[3]) {
++        const float f[3] = {P.R[6], P.R[7], P.R[8]};
++        const float d = (_center[0] - P.C[0]) * f[0] + (_center[1] - P.C[1]) * f[1] +
++                        (_center[2] - P.C[2]) * f[2];
++        for (int k = 0; k < 3; k++) { T[k] = P.C[k] + f[k] * d; U[k] = -P.R[3 + k]; }
++    };
++    float TA[3], UA[3], TB[3], UB[3], T[3], U[3];
++    aim(A, TA, UA);
++    aim(B, TB, UB);
++    for (int k = 0; k < 3; k++) { T[k] = TA[k] + (TB[k] - TA[k]) * a; U[k] = UA[k] + (UB[k] - UA[k]) * a; }
++    float z[3] = {T[0] - o.C[0], T[1] - o.C[1], T[2] - o.C[2]};
++    normalize3(z);
++    const float down[3] = {-U[0], -U[1], -U[2]};
++    float x[3], y[3];
++    cross(down, z, x);
++    normalize3(x);
++    cross(z, x, y);
++    for (int k = 0; k < 3; k++) { o.R[k] = x[k]; o.R[3 + k] = y[k]; o.R[6 + k] = z[k]; }
++    for (int k = 0; k < 4; k++) o.intr[k] = A.intr[k] + (B.intr[k] - A.intr[k]) * a;
++    o.distortion = "NONE";
++    return o;
++}
++
++void TrainCapture::begin(spirula::TrainerSession& s, const CaptureSettings& cs,
++                         int start_step, int total_steps) {
++    finish();
++    _cs = cs;
++    _tracks.clear();
++    _steps.clear();
++    _next = 0;
++    if (!cs.enabled || !cs.any_track()) return;
++    capture_frame_size(cs.resolution, _W, _H);
++
++    const auto& names = s.ds.image_filenames;
++    auto post_of = [&](const std::string& name) -> int {
++        for (size_t i = 0; i < names.size(); i++)
++            if (fs::path(names[i]).filename().string() == name)
++                return s.post.post_offsets.empty() ? (int)i : s.post.post_offsets[i];
++        return -1;
++    };
++    const fs::path root = s.out_dir / "captures";
++    for (const std::string& v : cs.fixed_views) {
++        const int p = post_of(v);
++        if (p >= 0) _tracks.push_back({(root / ("view_" + safe_stem(v))).string(), {p}, 0});
++    }
++    if (cs.arc) {
++        Track t{(root / "arc").string(), {}, 1};
++        for (const std::string& v : cs.arc_views)
++            if (int p = post_of(v); p >= 0) t.posts.push_back(p);
++        if (t.posts.size() >= 2) _tracks.push_back(std::move(t));
++    }
++    if (cs.orbit) {
++        if (int p = post_of(cs.orbit_view); p >= 0)
++            _tracks.push_back({(root / "orbit").string(), {p}, 2});
++    }
++    if (_tracks.empty()) return;
++
++    axes_focus(s.post, _center);
++    float up[3] = {0, 0, 0};
++    for (int64_t p = 0; p < s.post.n_post; p++)
++        for (int k = 0; k < 3; k++) up[k] -= s.post.viewmats[(size_t)p * 16 + 4 + k];
++    normalize3(up);
++    std::copy(up, up + 3, _up);
++
++    _steps = capture_schedule(cs, start_step, total_steps);
++    if (_steps.empty()) return;
++
++    _session = &s;
++    for (Track& t : _tracks) {
++        std::error_code ec;
++        fs::create_directories(t.dir, ec);
++        std::ofstream(fs::path(t.dir) / "frames.csv") << "frame,step\n";
++        if (cs.output == 0) continue;
++        render::Encoder e{render::Encoder::Ffmpeg, cs.ffmpeg, cs.codec == 0 ? "libx264" : "libx265"};
++        const std::string mp4 =
++            (fs::path(t.dir) / (fs::path(t.dir).filename().string() + ".mp4")).string();
++        t.video = render::open_pipe_sink(
++            render::encoder_argv(e, _W, _H, std::max(1.0f, cs.fps),
++                                 cs.codec == 0 ? render::Codec::H264 : render::Codec::H265,
++                                 cs.quality, false, mp4),
++            _W, _H);
++    }
++    stbi_write_png_compression_level = 4;
++    _closing = false;
++    for (int i = 0; i < 2; i++) _writers.emplace_back([this] { writer_loop(); });
++    char line[256];
++    std::snprintf(line, sizeof line,
++                  "Training capture: %d track(s), %d frames each at %dx%d (%s), into %s",
++                  (int)_tracks.size(), (int)_steps.size(), _W, _H,
++                  cs.output == 0 ? "PNG" : cs.output == 1 ? (cs.codec ? "H.265" : "H.264")
++                                                          : (cs.codec ? "PNG + H.265" : "PNG + H.264"),
++                  root.string().c_str());
++    s.log(line);
++}
++
++void TrainCapture::render(spirula::TrainerSession& s, const Pose& p, Job& job) {
++    const int W = _W, H = _H;
++    const float sc = std::min((float)W / (float)p.w, (float)H / (float)p.h);
++    const float intr[4] = {p.intr[0] * sc, p.intr[1] * sc,
++                           0.5f * W + (p.intr[2] - 0.5f * p.w) * sc,
++                           0.5f * H + (p.intr[3] - 0.5f * p.h) * sc};
++    float vm[16] = {0};
++    for (int r = 0; r < 3; r++) {
++        for (int c = 0; c < 3; c++) vm[r * 4 + c] = p.R[r * 3 + c];
++        vm[r * 4 + 3] = -(p.R[r * 3] * p.C[0] + p.R[r * 3 + 1] * p.C[1] + p.R[r * 3 + 2] * p.C[2]);
++    }
++    vm[15] = 1;
++    const int64_t npx = (int64_t)W * H;
++    _rgb.resize((size_t)npx * 3);
++    _ts.resize((size_t)npx);
++    {
++        std::lock_guard<std::mutex> lk(s.engine_mutex);
++        set_camera_params(W, H, p.model, p.distortion, tvp(vm, 4, {1, 4, 4}),
++                          tvp(intr, 4, {1, 4}), tvp(p.dist, 4, {1, 8}));
++        // The bare splats: training's random background would tint every
++        // half-transparent edge with that step's noise.
++        const bool bg = engine_set_background_enabled(false);
++        try {
++            forward_3dgs(s.cfg.primitive, 100, s.cfg.packed, false, 0);
++            engine_copy_render_to_host(tvp(_rgb.data(), 4, {1, H, W, 3}), tv_null(),
++                                       tvp(_ts.data(), 4, {1, H, W, 1}), tv_null(), tv_null());
++        } catch (...) {
++            engine_set_background_enabled(bg);
++            throw;
++        }
++        engine_set_background_enabled(bg);
++    }
++    job.W = W;
++    job.H = H;
++    job.ch = _cs.transparent ? 4 : 3;
++    const bool png = _cs.output != 1, video = _cs.output != 0;
++    if (png) job.px.resize((size_t)npx * job.ch);
++    if (video) job.rgb.resize((size_t)npx * 3);
++    auto to8 = [](float v) { return (uint8_t)(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
++    for (int64_t i = 0; i < npx; i++) {
++        const float a = std::clamp(1.0f - _ts[(size_t)i], 0.0f, 1.0f);
++        for (int c = 0; c < 3; c++) {
++            const float pre = std::min(_rgb[(size_t)i * 3 + c], a);
++            if (video) job.rgb[(size_t)i * 3 + c] = to8(pre);
++            // PNG alpha is straight, the render premultiplied.
++            if (png) job.px[(size_t)i * job.ch + c] =
++                to8(_cs.transparent ? (a > 1e-4f ? pre / a : 0.0f) : pre);
++        }
++        if (png && _cs.transparent) job.px[(size_t)i * 4 + 3] = to8(a);
++    }
++}
++
++void TrainCapture::on_step(spirula::TrainerSession& s, int step) {
++    if (_next >= _steps.size() || step < _steps[_next]) return;
++    while (_next + 1 < _steps.size() && _steps[_next + 1] <= step) _next++;
++    const int frame = (int)_next;
++    const float u = _steps.size() > 1 ? (float)frame / (float)(_steps.size() - 1) : 0.0f;
++    _next++;
++    for (Track& t : _tracks) {
++        Job job;
++        char name[64];
++        std::snprintf(name, sizeof name, "frame_%05d.png", frame);
++        job.path = (fs::path(t.dir) / name).string();
++        try {
++            render(s, track_pose(s, t, u), job);
++        } catch (const std::exception& e) {
++            s.log(std::string("Training capture: render failed: ") + e.what());
++            continue;
++        }
++        std::ofstream(fs::path(t.dir) / "frames.csv", std::ios::app) << frame << "," << step << "\n";
++        if (t.video && !t.video->push(std::move(job.rgb))) {
++            s.log("Training capture: video encoder stopped for " + t.dir + ": " + t.video->error());
++            t.video->cancel();
++            t.video.reset();
++        }
++        if (_cs.output == 1) continue;
++        std::unique_lock<std::mutex> lk(_mu);
++        _cv_room.wait(lk, [&] { return _queue.size() < 4; });
++        _queue.push_back(std::move(job));
++        _cv_job.notify_one();
++    }
++}
++
++void TrainCapture::writer_loop() {
++    for (;;) {
++        Job job;
++        {
++            std::unique_lock<std::mutex> lk(_mu);
++            _cv_job.wait(lk, [&] { return _closing || !_queue.empty(); });
++            if (_queue.empty()) return;
++            job = std::move(_queue.front());
++            _queue.pop_front();
++        }
++        _cv_room.notify_one();
++        stbi_write_png(job.path.c_str(), job.W, job.H, job.ch, job.px.data(), job.W * job.ch);
++    }
++}
++
++void TrainCapture::finish() {
++    {
++        std::lock_guard<std::mutex> lk(_mu);
++        _closing = true;
++    }
++    _cv_job.notify_all();
++    for (std::thread& t : _writers) if (t.joinable()) t.join();
++    _writers.clear();
++    _closing = false;
++    for (Track& t : _tracks) {
++        if (!t.video) continue;
++        const bool ok = t.video->finish();
++        if (_session)
++            _session->log(ok ? "Training capture: wrote " + fs::path(t.dir).filename().string() + ".mp4"
++                             : "Training capture: video failed for " + t.dir + ": " + t.video->error());
++        t.video.reset();
++    }
++}
++
++}  // namespace gui
+diff --git a/src/app/gui/TrainCapture.h b/src/app/gui/TrainCapture.h
+new file mode 100644
+index 00000000..bd95b15f
+--- /dev/null
++++ b/src/app/gui/TrainCapture.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++// TrainCapture -- PNG image sequences of the model as it trains, rendered on
++// the training thread between steps from fixed training views, an arc through
++// several views, or an orbit about the scene. Independent of every preview.
++// Frames go to <run>/captures/<track>/: frame_%05d.png and/or <track>.mp4
++// (ffmpeg, H.264 or H.265), with frames.csv mapping frames to steps.
++
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace spirula { class TrainerSession; }
++namespace gui::render { class FrameSink; }
++
++namespace gui {
++
++struct CaptureSettings {
++    bool enabled = false;
++    int resolution = 0;          // 0 HD 1920x1080, 1 2K 2560x1440, 2 4K 3840x2160
++    int every_steps = 100;
++    bool dense_start = true;     // 5x more often over the first 10 intervals
++    bool transparent = true;     // RGBA over nothing, else RGB over black
++    int output = 1;              // 0 PNG frames, 1 video, 2 both
++    int codec = 1;               // 0 H.264, 1 H.265 (video is always over black)
++    int quality = 1;             // 0 best, 1 balanced, 2 smallest
++    float fps = 30.0f;
++    std::string ffmpeg = "ffmpeg";   // set from the app's tool path, not saved
++    // Image file names (not indices) so a saved selection survives a re-parse.
++    std::vector<std::string> fixed_views;
++    bool arc = false;
++    std::vector<std::string> arc_views;   // keyframes, in order
++    bool orbit = false;
++    std::string orbit_view;
++    float orbit_degrees = 360.0f;
++
++    bool any_track() const {
++        return !fixed_views.empty() || (arc && arc_views.size() >= 2) ||
++               (orbit && !orbit_view.empty());
++    }
++};
++
++void capture_frame_size(int resolution, int& W, int& H);
++// The steps a run from `start` to `total` captures at, ascending.
++std::vector<int> capture_schedule(const CaptureSettings& cs, int start, int total);
++// gui.conf persistence: capture_* keys.
++void read_capture_setting(CaptureSettings& cs, const std::string& k, const std::string& v);
++void write_capture_settings(FILE* f, const CaptureSettings& cs);
++
++class TrainCapture {
++public:
++    ~TrainCapture() { finish(); }
++
++    // Training thread, after setup_engine(). Logs what it will write.
++    void begin(spirula::TrainerSession& s, const CaptureSettings& cs,
++               int start_step, int total_steps);
++    // Training thread, engine mutex NOT held: renders when `step` is due.
++    void on_step(spirula::TrainerSession& s, int step);
++    // Waits for the PNG writers to drain.
++    void finish();
++
++private:
++    struct Pose { float R[9]; float C[3]; float intr[4]; int w = 0, h = 0;
++                  std::string model, distortion; float dist[8]; };
++    struct Track { std::string dir; std::vector<int> posts; int kind = 0;
++                   std::shared_ptr<render::FrameSink> video; };
++    struct Job { std::string path; int W = 0, H = 0, ch = 4;
++                 std::vector<uint8_t> px, rgb; };   // rgb: over black, for video
++
++    Pose post_pose(const spirula::TrainerSession& s, int p) const;
++    Pose track_pose(const spirula::TrainerSession& s, const Track& t, float u) const;
++    void render(spirula::TrainerSession& s, const Pose& p, Job& job);
++    spirula::TrainerSession* _session = nullptr;   // for finish()'s log
++    void writer_loop();
++
++    CaptureSettings _cs;
++    std::vector<Track> _tracks;
++    std::vector<int> _steps;      // capture schedule, ascending
++    size_t _next = 0;             // index into _steps
++    int _W = 0, _H = 0;
++    float _center[3] = {0, 0, 0}, _up[3] = {0, 0, 1};
++    std::vector<float> _rgb, _ts; // host scratch, reused
++
++    std::mutex _mu;
++    std::condition_variable _cv_job, _cv_room;
++    std::deque<Job> _queue;
++    bool _closing = false;
++    std::vector<std::thread> _writers;
++};
++
++}  // namespace gui
+diff --git a/src/app/gui/TrainCapturePanel.cpp b/src/app/gui/TrainCapturePanel.cpp
+new file mode 100644
+index 00000000..dac47bac
+--- /dev/null
++++ b/src/app/gui/TrainCapturePanel.cpp
+@@ -0,0 +1,159 @@
++// TrainCapturePanel.cpp -- the trainer screen's "Training animation capture"
++// section (GuiApp::draw_capture_panel); the capture itself is TrainCapture.
++
++#include "app/gui/GuiApp.h"
++#include "app/gui/Layout.h"
++#include "app/gui/Ui.h"
++
++#include <algorithm>
++#include <cctype>
++#include <filesystem>
++
++namespace fs = std::filesystem;
++
++namespace gui {
++
++namespace {
++
++const ImVec4 kWarn(0.95f, 0.75f, 0.30f, 1.0f);
++
++bool has(const std::vector<std::string>& v, const std::string& s) {
++    return std::find(v.begin(), v.end(), s) != v.end();
++}
++void toggle(std::vector<std::string>& v, const std::string& s, bool on) {
++    v.erase(std::remove(v.begin(), v.end(), s), v.end());
++    if (on) v.push_back(s);
++}
++bool icontains(const std::string& hay, const std::string& needle) {
++    if (needle.empty()) return true;
++    auto it = std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
++                          [](char a, char b) { return std::tolower((unsigned char)a) ==
++                                                      std::tolower((unsigned char)b); });
++    return it != hay.end();
++}
++
++}  // namespace
++
++void GuiApp::draw_capture_panel() {
++    if (!ui::CollapsingHeaderRaw("Training animation capture###capture_header")) return;
++    const TrainRunner::Phase ph = _runner.phase();
++    const bool running = ph == TrainRunner::Phase::Preparing ||
++                         ph == TrainRunner::Phase::Training;
++    CaptureSettings& c = _capture;
++    bool dirty = false;
++
++    ImGui::BeginDisabled(running);
++    dirty |= ui::CheckboxRaw("Capture image sequences while training###cap_on", &c.enabled);
++    ImGui::BeginDisabled(!c.enabled);
++
++    const char* res[] = {"HD  1920 x 1080", "2K  2560 x 1440", "4K  3840 x 2160"};
++    ImGui::SetNextItemWidth(px(170.0f));
++    dirty |= ui::ComboRaw("Resolution###cap_res", &c.resolution, res, 3);
++    const char* outs[] = {"PNG frames", "Video (MP4)", "PNG frames + video"};
++    ImGui::SetNextItemWidth(px(170.0f));
++    dirty |= ui::ComboRaw("Output###cap_output", &c.output, outs, 3);
++    if (c.output != 0) {
++        const char* codecs[] = {"H.264", "H.265 (smaller)"};
++        ImGui::SetNextItemWidth(px(170.0f));
++        dirty |= ui::ComboRaw("Codec###cap_codec", &c.codec, codecs, 2);
++        const char* quals[] = {"Best", "Balanced", "Smallest"};
++        ImGui::SetNextItemWidth(px(170.0f));
++        dirty |= ui::ComboRaw("Quality###cap_quality", &c.quality, quals, 3);
++        ImGui::SetNextItemWidth(px(170.0f));
++        if (ui::InputFloatRaw("Frames per second###cap_fps", &c.fps, "%.0f")) {
++            c.fps = std::clamp(c.fps, 1.0f, 120.0f);
++            dirty = true;
++        }
++    }
++    if (c.output != 1) {
++        int bg = c.transparent ? 0 : 1;
++        const char* bgs[] = {"Transparent", "Black"};
++        ImGui::SetNextItemWidth(px(170.0f));
++        if (ui::ComboRaw("PNG background###cap_bg", &bg, bgs, 2)) { c.transparent = bg == 0; dirty = true; }
++    }
++    ImGui::SetNextItemWidth(px(170.0f));
++    if (ui::InputIntRaw("Capture every N steps###cap_every", &c.every_steps)) {
++        c.every_steps = std::max(1, c.every_steps);
++        dirty = true;
++    }
++    dirty |= ui::CheckboxRaw("5x as often for the first 10 captures' worth of steps###cap_dense",
++                             &c.dense_start);
++
++    dirty |= ui::CheckboxRaw("Arc: move through the views ticked under Arc, in tick order###cap_arc",
++                             &c.arc);
++    dirty |= ui::CheckboxRaw("Orbit: circle the subject from the view chosen under Orbit###cap_orbit",
++                             &c.orbit);
++    if (c.orbit) {
++        ImGui::SetNextItemWidth(px(170.0f));
++        dirty |= ui::InputFloatRaw("Orbit degrees over the run###cap_deg", &c.orbit_degrees, "%.0f");
++    }
++
++    spirula::TrainerSession* s = _runner.session();
++    const bool have = s && !s->ds.image_filenames.empty();
++    if (!have) {
++        ui::TextDisabledRaw("Open a dataset to choose views.");
++    } else {
++        ImGui::SetNextItemWidth(px(250.0f));
++        ui::InputTextRaw("Filter views###cap_filter", &_capture_filter);
++        const ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
++                                   ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingFixedFit;
++        if (ImGui::BeginTable("##cap_views", 4, tf, ImVec2(0, px(220.0f)))) {
++            ImGui::TableSetupScrollFreeze(0, 1);
++            ui::TableSetupColumnRaw("View", ImGuiTableColumnFlags_WidthStretch);
++            ui::TableSetupColumnRaw("Fixed", 0, px(44.0f));
++            ui::TableSetupColumnRaw("Arc", 0, px(64.0f));
++            ui::TableSetupColumnRaw("Orbit", 0, px(44.0f));
++            ImGui::TableHeadersRow();
++            const auto& names = s->ds.image_filenames;
++            for (size_t i = 0; i < names.size(); i++) {
++                const std::string name = fs::path(names[i]).filename().string();
++                if (!icontains(name, _capture_filter)) continue;
++                ImGui::PushID((int)i);
++                ImGui::TableNextRow();
++                ImGui::TableSetColumnIndex(0);
++                ui::TextRaw(name);
++                ImGui::TableSetColumnIndex(1);
++                bool fixed_on = has(c.fixed_views, name);
++                if (ui::CheckboxRaw("##fixed", &fixed_on)) { toggle(c.fixed_views, name, fixed_on); dirty = true; }
++                ImGui::TableSetColumnIndex(2);
++                bool arc_on = has(c.arc_views, name);
++                if (ui::CheckboxRaw("##arc", &arc_on)) { toggle(c.arc_views, name, arc_on); dirty = true; }
++                if (arc_on) {
++                    const auto at = std::find(c.arc_views.begin(), c.arc_views.end(), name);
++                    ImGui::SameLine();
++                    ui::TextDisabledRaw(std::to_string(at - c.arc_views.begin() + 1));
++                }
++                ImGui::TableSetColumnIndex(3);
++                if (ui::RadioButtonRaw("##orbit", c.orbit_view == name)) {
++                    c.orbit_view = c.orbit_view == name ? std::string() : name;
++                    dirty = true;
++                }
++                ImGui::PopID();
++            }
++            ImGui::EndTable();
++        }
++        if (!c.arc_views.empty() && ui::ButtonRaw("Clear arc###cap_clear_arc")) {
++            c.arc_views.clear();
++            dirty = true;
++        }
++    }
++
++    const int frames = (int)capture_schedule(c, 0, std::max(1, _cfg.num_iterations)).size();
++    int tracks = (int)c.fixed_views.size() + (c.arc && c.arc_views.size() >= 2 ? 1 : 0) +
++                 (c.orbit && !c.orbit_view.empty() ? 1 : 0);
++    int W = 0, H = 0;
++    capture_frame_size(c.resolution, W, H);
++    ui::TextDisabledRaw(std::to_string(tracks) + " sequence(s), about " + std::to_string(frames) +
++                        " frames each at " + std::to_string(W) + " x " + std::to_string(H));
++    ui::TextDisabledRaw("Written to <run folder>/captures/ (view_<name>, arc, orbit)");
++    if (c.output != 0)
++        ui::TextDisabledRaw("Video is encoded by ffmpeg on the CPU, over a black background.");
++    if (c.arc && c.arc_views.size() < 2) ui::TextColoredRaw(kWarn, "The arc needs at least two views.");
++    if (c.orbit && c.orbit_view.empty()) ui::TextColoredRaw(kWarn, "Choose the orbit's starting view.");
++
++    ImGui::EndDisabled();
++    ImGui::EndDisabled();
++    if (dirty) save_settings();
++}
++
++}  // namespace gui
+diff --git a/src/app/gui/TrainRunner.cpp b/src/app/gui/TrainRunner.cpp
+index 7fb917ff..3d791fac 100644
+--- a/src/app/gui/TrainRunner.cpp
++++ b/src/app/gui/TrainRunner.cpp
+@@ -170,12 +170,14 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
+                     {(long long)s->cfg.viewer_port}));
+             }
+ 
++            _capture.begin(*s, _capture_cfg, s->start_step, s->cfg.num_iterations);
+             _phase = Phase::Training;
+             spirula::TrainerCallbacks cb;
+             cb.on_data_error = [this](const std::string& what) {
+                 return await_data_decision(what);
+             };
+-            cb.on_step = [this](const spirula::TrainerProgress& p) {
++            cb.on_step = [this, s](const spirula::TrainerProgress& p) {
++                _capture.on_step(*s, p.step);
+                 std::lock_guard<std::mutex> lk(_mu);
+                 _latest = p;
+                 _latencies.push_back(p.step_latency);
+@@ -193,6 +195,7 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
+                 _metrics.push_back(m);
+             };
+             s->train(cb);
++            _capture.finish();
+             if (!s->stop_requested.load() && s->cfg.eval_mode != "all") {
+                 _phase = Phase::Evaluating;
+                 s->eval([this](const spirula::EvalProgress& p) {
+@@ -202,6 +205,7 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
+             }
+             _phase = Phase::Done;
+         } catch (const std::exception& e) {
++            _capture.finish();
+             std::lock_guard<std::mutex> lk(_mu);
+             _error = e.what();
+             _phase = Phase::TrainError;
+diff --git a/src/app/gui/TrainRunner.h b/src/app/gui/TrainRunner.h
+index ad03d77f..a5082c04 100644
+--- a/src/app/gui/TrainRunner.h
++++ b/src/app/gui/TrainRunner.h
+@@ -14,6 +14,7 @@
+ //    RenderWorker attach.
+ 
+ #include "app/TrainerCore.h"
++#include "app/gui/TrainCapture.h"
+ #include "app/webviewer/Viewer.h"
+ 
+ #include <atomic>
+@@ -57,6 +58,9 @@ public:
+     // must detach viewers from the previous one first.
+     void start_training(const TrainConfig& cfg, const std::string& preset);
+ 
++    // Image-sequence capture for the next start_training().
++    void set_capture(const CaptureSettings& cs) { _capture_cfg = cs; }
++
+     void set_paused(bool p);
+     bool paused() const;
+     // Graceful: finish the step in flight, then save a final checkpoint
+@@ -118,6 +122,8 @@ private:
+ 
+     std::unique_ptr<spirula::TrainerSession> _session;
+     std::unique_ptr<ViewerServer> _web_viewer;
++    CaptureSettings _capture_cfg;
++    TrainCapture _capture;
+     std::thread _worker;
+     std::atomic<Phase> _phase{Phase::Idle};
+     std::atomic<bool> _engine_ready{false};
+diff --git a/src/app/gui/Ui.h b/src/app/gui/Ui.h
+index ed14476c..a8aba8ce 100644
+--- a/src/app/gui/Ui.h
++++ b/src/app/gui/Ui.h
+@@ -463,6 +463,9 @@ inline bool BeginTabItem(const Msg& m, ImGuiTabItemFlags flags = 0) {
+ inline bool CollapsingHeader(const Msg& m, ImGuiTreeNodeFlags flags = 0) {
+     return ImGui::CollapsingHeader(detail::label(m), flags);
+ }
++inline bool CollapsingHeaderRaw(const char* id, ImGuiTreeNodeFlags flags = 0) {
++    return ImGui::CollapsingHeader(id, flags);
++}
+ inline bool TreeNode(const Msg& m) { return ImGui::TreeNode(detail::label(m)); }
+ inline bool TreeNode(const Msg& m, std::initializer_list<Arg> a) {
+     return ImGui::TreeNode(detail::label(format(m, a), m));
+diff --git a/src/engine/Engine.h b/src/engine/Engine.h
+index 776ea599..2f746cdc 100644
+--- a/src/engine/Engine.h
++++ b/src/engine/Engine.h
+@@ -296,6 +296,9 @@ void engine_background_optim_step(int step, const BackgroundStepConfig& cfg);
+ // (..., H, W, 3) float buffer: SH gives the last forward's skybox, Color and
+ // the randomized modes a flat fill. 0 when no background is active.
+ int engine_copy_background_to_host(TorchTensorView out_image);
++// Turns the background blend on or off for the forwards that follow and returns
++// whether it was on: side renders (training capture) want the bare splats.
++bool engine_set_background_enabled(bool on);
+ 
+ // --- Linear / wide-gamut color space ---
+ //
+diff --git a/src/engine/EngineForward.cpp b/src/engine/EngineForward.cpp
+index 84f433ea..898e39a3 100644
+--- a/src/engine/EngineForward.cpp
++++ b/src/engine/EngineForward.cpp
+@@ -471,6 +471,12 @@ void forward_3dgs(
+ }
+ 
+ 
++bool engine_set_background_enabled(bool on) {
++    const bool was = engine().background.enabled;
++    engine().background.enabled = on;
++    return was;
++}
++
+ void engine_debug_forward(
+     TorchTensorView override_features_dc,
+     int override_sh_degree,
+-- 
+2.47.1
+
