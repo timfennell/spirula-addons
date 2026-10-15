@@ -25,6 +25,10 @@ A **Training animation capture** section on the trainer screen with:
 Frames go to `<run folder>/captures/<track>/`, with a `frames.csv` listing
 which training step each frame shows.
 
+<img src="../media/training-capture-panel.png" width="420" alt="The Training animation capture panel, with an arc through fourteen training views">
+
+*The panel, set up for an arc through fourteen training views.*
+
 ## Cost
 
 Frames render on the training thread between steps, through the trainer's own

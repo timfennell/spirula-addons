@@ -27,6 +27,16 @@ inside is full of junk. Look at one wall face-on and you can see through it.
 *Left: 400 training steps without Voids block light; the checkerboard shows
 through the back wall. Right: the same 400 steps with it; the wall is solid.*
 
+![The cross-section void editor: a slice through a bee with the thorax void outlined in blue](../media/void-editor.png)
+
+*The void editor on a finished bee: slice 24 of 45 through the body, with the
+thorax void (blue, selected, with its key-slice points) and the abdomen void
+(red).*
+
+<img src="../media/keep-out-panel.png" width="420" alt="The Keep-out regions panel on the trainer screen">
+
+*The Keep-out regions section on the trainer screen.*
+
 ## Workflow
 
 1. **Draft for shapes.** Train a quick model only to see the body's outline:

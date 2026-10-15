@@ -13,6 +13,10 @@ camera rig. Each one installs on its own; pick one, or both.
 
 *An arc capture of a bee training from scratch ([1080p video](media/training-capture-arc-1080p.mp4)).*
 
+![The cross-section void editor](media/void-editor.png)
+
+*The insect voids editor: drawing voids on a cross section of a bee.*
+
 ## Installing
 
 **Easiest:** clone a ready-made branch of Spirula with the add-ons already in
