@@ -17,10 +17,11 @@ inside is full of junk. Look at one wall face-on and you can see through it.
 - **Cross-section void editor:** cuts your model into slices so you can draw
   where the inside should be empty.
 - **Keep-out:** while training, splats inside the voids fade away.
-- **Voids block light:** while training, each camera ray stops where it
-  enters a void. The shell can no longer lean on the wall behind it, so it
-  has to become solid by itself, and the shine ends up on its outer surface,
-  where it belongs.
+- **Voids block light:** while training, every void acts as an opaque wall
+  that shows a new random colour each step. A camera ray stops where it
+  enters a void, and any light the shell lets through lands on that noise. The
+  shell can no longer lean on the wall behind it, so it has to become solid by
+  itself, and the shine ends up on its outer surface, where it belongs.
 
 ![Before and after: the back wall of a bee's abdomen with the belly cut away, over a checkerboard](../media/void-stop-before-after.png)
 
@@ -170,6 +171,44 @@ In your viewer, cut the finished model in half and look at one wall face-on.
 It should be solid, with an empty inside.
 
 ---
+
+## How it works
+
+The voids are fixed shapes: training never moves or learns them. Each blob is
+a stack of thin prisms, one per slice: your outline on that slice, extruded
+through the slice's thickness. Training only asks them two questions.
+
+1. **Is this splat inside a void?** At each step where training adds and
+   moves splats, any splat whose centre is inside a void keeps only 70% of
+   its opacity, and no new splats are placed there. Splats the photos really
+   need can win their opacity back; the rest fade out.
+2. **Where does this camera ray first enter a void?** Before each training
+   step, every camera's rays are traced through the voids (a small per-pixel
+   depth map, computed once per camera). In the renderer, a ray that reaches a
+   void ends there: splats behind it don't count for that pixel, and whatever
+   light is left lands on the void's colour. That colour is random tiles of
+   pure colours, different every step, faded in over the first steps like
+   Spirula's random backgrounds. The learning pass takes this into account
+   exactly.
+
+So everything a camera sees in front of a void has to come from the shell
+between the camera and the void. A see-through shell shows noise and costs
+loss, so the only stable answer is a solid shell carrying its own colour and
+shine. This only happens during training: previews, renders and exported
+models draw normally.
+
+It's the same idea as
+[Noise Guided Splatting](https://opsiclear.github.io/ngs/) (El Hakie et al.,
+NeurIPS 2025), which fills an object's convex hull with random-colour splats.
+Drawn voids follow concave, hairy bodies such as an insect's waist and legs,
+which a hull would fill in, and the ray cut-off needs no extra splats.
+
+**Draw the voids carefully.** Because training can't adjust them:
+
+- A void drawn **too large** cuts into the real shell; that spot comes out
+  thin or dark.
+- A void drawn **too small** leaves a gap under the surface where splats can
+  still sink.
 
 ## Good to know
 

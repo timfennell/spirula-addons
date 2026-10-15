@@ -1,7 +1,7 @@
 From 9afbf230fcce5ccab4d75d93a89560d2cb9c587d Mon Sep 17 00:00:00 2001
 From: Tim Fennell <2501251+timfennell@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 18:23:20 -0500
-Subject: [PATCH 1/2] Training animation capture: record the model while it
+Subject: [PATCH 1/3] Training animation capture: record the model while it
  trains
 
 A "Training animation capture" panel on the trainer screen renders the
@@ -985,7 +985,7 @@ index 84f433ea..898e39a3 100644
 From 7755c057d9bf79e106df4500c01522c20c11fa8b Mon Sep 17 00:00:00 2001
 From: Tim Fennell <2501251+timfennell@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 10:07:59 -0500
-Subject: [PATCH 2/2] Insect voids: cross-section void editor, and voids that
+Subject: [PATCH 2/3] Insect voids: cross-section void editor, and voids that
  block light
 
 A glossy convex body mirrors its lights as a virtual image behind its
@@ -3306,6 +3306,513 @@ index 2844db43..c1023b58 100644
  SS_MSG(roi_outside_weight_help,
      EN("What a splat outside the region of interest counts for when "
         "densification picks where to relocate or add splats, relative to 1 "
+-- 
+2.47.1
+
+
+From c6579edb77722ccc203c41f6fb9d4d0d9685d519 Mon Sep 17 00:00:00 2001
+From: Tim Fennell <2501251+timfennell@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:21:29 -0500
+Subject: [PATCH 3/3] Voids are opaque and show noise while training
+
+A ray that reaches a void now lights a random colour with what is left of
+it, instead of letting the background show: a cube corner per 64 px cell,
+the grid shifted every step, faded in from grey with the same warm-up as
+the random backgrounds. The pixel is reported covered, so the background
+never shows through a void, and the near wall has to be opaque whatever
+--background-mode is. The same idea as Noise Guided Splatting (NeurIPS
+2025), with drawn voids and a ray cut-off instead of hull infill splats.
+
+The void buffer gains the step's seed and strength and room for the light
+left at each void pixel; the 2D raster backward reads that light back,
+takes the gradient from the void's colour, and removes it from the
+composite before rebuilding the distortion moments.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/notes/insect-voids.md                    | 45 +++++++++++++------
+ src/app/TrainerCore.cpp                       |  5 +++
+ src/backend/api/VoidStop.h                    | 16 ++++---
+ src/backend/vulkan/kernels/RasterizeBwd.cpp   | 12 ++++-
+ .../vulkan/shaders/rasterize_bwd.slang        | 26 +++++++++--
+ .../vulkan/shaders/rasterize_fwd.slang        | 21 ++++++---
+ src/backend/vulkan/shaders/void_noise.slang   | 40 +++++++++++++++++
+ src/engine/EngineConfig.h                     |  1 +
+ src/engine/EngineForward.cpp                  |  5 ++-
+ src/engine/EngineLoss.cpp                     |  5 +++
+ src/engine/EngineState.h                      |  6 ++-
+ src/engine/EngineTrainStep.cpp                | 24 +++++++---
+ 12 files changed, 164 insertions(+), 42 deletions(-)
+ create mode 100644 src/backend/vulkan/shaders/void_noise.slang
+
+diff --git a/docs/notes/insect-voids.md b/docs/notes/insect-voids.md
+index 1a27874a..43e2905b 100644
+--- a/docs/notes/insect-voids.md
++++ b/docs/notes/insect-voids.md
+@@ -62,8 +62,9 @@ far wall, seen through the near one. Cut the model in half and look at one
+ wall face-on, and the background shows through it.
+ 
+ `--roi-void-stop 1` ("Voids block light", default on in the panel) closes
+-that. Before each training forward, every camera ray stops where it first
+-enters a void:
++that by treating every void as an opaque wall that shows noise. Before each
++training forward, every camera ray stops where it first enters a void, and the
++light left there lands on a random colour:
+ 
+ - `data/RegionRaycast.h` casts the batch's cameras against the region on the
+   CPU: clip to the voids' bounding box (`region_void_bounds`, from the CSG
+@@ -71,18 +72,34 @@ enters a void:
+   void. Lens distortion (OpenCV, thin prism) is undone per pixel. The map is
+   512 px on its long side and is cached per camera pose, so after the first
+   epoch it costs nothing.
+-- The engine uploads it (`fwd.void_depth`) and arms
+-  `backend::void_stop()` (`backend/api/VoidStop.h`) for that one forward; the
+-  Vulkan 2D raster (`rasterize_fwd_2d`, spec constant `kVoidStop`) ends a
+-  pixel's ray at the first splat whose depth is past the void.
+-- The backward needs no change: it replays each pixel from the forward's
+-  `last_ids`, which already stop short of the void.
+-- Light that gets through the near wall now meets the (random) background
+-  instead of the far wall, so the alpha loss makes the near wall opaque by
+-  itself, and the highlight has to live on its outer surface as SH.
+-
+-Previews, the viewer and exports never see the stop: the training step arms it
+-immediately before its own forward and the forward disarms it.
++- The engine uploads one buffer per step (`fwd.void_depth`; layout in
++  `shaders/void_noise.slang`): the step's seed and noise strength, the maps,
++  and room for the light left at each void pixel. It arms
++  `backend::void_stop()` (`backend/api/VoidStop.h`) for that one forward.
++- The Vulkan 2D raster (`rasterize_fwd_2d`, spec constant `kVoidStop`) ends a
++  pixel's ray at the first splat whose depth is past the void, adds the light
++  left times the void's colour, stores that light in the buffer, and reports
++  the pixel as covered, so the background never shows through a void.
++- The void's colour is a cube corner (each channel 0 or 1) per 64 px cell,
++  with the grid shifted every step, so no splat can learn it. It fades in from
++  grey with the same warm-up as Spirula's random backgrounds
++  (`--background-noise-warmup`, `--background-noise-pre-warmup`), so splats
++  are not washed away at the start. It works whatever `--background-mode` is.
++- The loss backward arms `backend::void_stop_bwd()`. For void pixels, the
++  raster backward (`rasterize_bwd_2d`) starts from the stored light, takes its
++  gradient from the void's colour, and removes that colour from the composite
++  before rebuilding the distortion moments. Other pixels are unchanged, and
++  each pixel replays from `last_ids`, which already stops short of the void.
++
++The near wall alone now decides what a camera sees there. Light it lets
++through is noise that costs loss every step, so the wall has to become opaque
++by itself, and the highlight has to live on its outer surface as SH. This is
++the idea behind Noise Guided Splatting (El Hakie et al., NeurIPS 2025), which
++fills an object's convex hull with random-colour Gaussians; drawn voids
++follow concave bodies, and a ray cut-off needs no extra splats.
++
++Previews, the viewer and exports never see any of this: the training step arms
++it immediately before its own forward and backward, and each disarms it.
+ 
+ Limits: the Vulkan backend and the 2D primitives (3dgs, mip) only -- the
+ trainer logs why and carries on without it otherwise; pinhole cameras (the
+diff --git a/src/app/TrainerCore.cpp b/src/app/TrainerCore.cpp
+index d65bfa62..6bb83179 100644
+--- a/src/app/TrainerCore.cpp
++++ b/src/app/TrainerCore.cpp
+@@ -673,6 +673,11 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
+     cfg.ppisp.run_before_color_space = c.apply_ppisp_before_color_space;
+ 
+     // ---- background ----------------------------------------------------
++    {
++        // Voids show noise whatever the background, warmed up the same way.
++        float rw = std::min((float)step / std::max(c.background_noise_warmup, 1), 1.0f);
++        cfg.background.void_noise_weight = 1.0f - (1.0f - c.background_noise_pre_warmup) * (1.0f - rw);
++    }
+     if (c.background_mode == "noise" || c.background_mode == "pseudorandom" ||
+         c.background_mode == "random") {
+         float rw = std::min((float)step / std::max(c.background_noise_warmup, 1), 1.0f);
+diff --git a/src/backend/api/VoidStop.h b/src/backend/api/VoidStop.h
+index 0a255e36..e89df79c 100644
+--- a/src/backend/api/VoidStop.h
++++ b/src/backend/api/VoidStop.h
+@@ -1,16 +1,16 @@
+ #pragma once
+ 
+-// "Voids block light": per-pixel camera depths past which the next 2D raster
+-// forward stops each ray. The engine fills it right before a training forward
+-// and clears it right after, so previews and viewer renders never see it.
+-// Only the Vulkan backend reads it (backend/vulkan/kernels/RasterizeFwd.cpp).
++// "Voids block light": a void is opaque and shows noise. The next 2D raster
++// forward stops each ray where it enters a void and lights the void's colour
++// with what is left; its backward reads that light back. Armed by a training
++// step only, so previews never see it. Vulkan only (shaders/void_noise.slang).
+ 
+ #include <cstdint>
+ 
+ namespace backend {
+ 
+ struct VoidStop {
+-    uint64_t depth = 0;   // device address of [I, height, width] floats, 0 = off
++    uint64_t depth = 0;   // device address of the void buffer (void_noise.slang), 0 = off
+     uint32_t width = 0, height = 0;
+ };
+ 
+@@ -19,4 +19,10 @@ inline VoidStop& void_stop() {
+     return s;
+ }
+ 
++// The same buffer for the training step's raster backward.
++inline VoidStop& void_stop_bwd() {
++    static VoidStop s;
++    return s;
++}
++
+ }  // namespace backend
+diff --git a/src/backend/vulkan/kernels/RasterizeBwd.cpp b/src/backend/vulkan/kernels/RasterizeBwd.cpp
+index 3423e828..ef33de6e 100644
+--- a/src/backend/vulkan/kernels/RasterizeBwd.cpp
++++ b/src/backend/vulkan/kernels/RasterizeBwd.cpp
+@@ -10,6 +10,7 @@
+ #include <kernels/raster/RasterizationBwd.cuh>
+ #include <kernels/raster/RasterizationEval3DBwd.cuh>
+ 
++#include "backend/api/VoidStop.h"
+ #include "backend/vulkan/kernels/KernelCommon.h"
+ 
+ #include <optional>
+@@ -29,8 +30,10 @@ struct Raster2dBwdParams {
+     uint32_t I, N, n_isects, width, height, tile_width, tile_height, macro_log2;
+     float v_dist_rgb_per_depth;
+     uint32_t state_flags;
++    uint64_t void_buf;
++    uint32_t void_w, void_h;
+ };
+-static_assert(sizeof(Raster2dBwdParams) == 20 * 8 + 10 * 4,
++static_assert(sizeof(Raster2dBwdParams) == 21 * 8 + 12 * 4,
+               "params layout must match the slang struct");
+ 
+ // Mirrors Raster3dgutBwdParams.
+@@ -190,6 +193,13 @@ std::tuple<
+         p.tile_width = tile_width;
+         p.tile_height = tile_height;
+         p.macro_log2 = (uint32_t)macro_log2;
++        // One shot: the training forward's voids, for this backward only.
++        const backend::VoidStop vs = backend::void_stop_bwd();
++        backend::void_stop_bwd() = {};
++        const bool void_on = vs.depth != 0 && vs.width > 0 && vs.height > 0;
++        p.void_buf = void_on ? vs.depth : vkk::or_fallback(uint64_t{0});
++        p.void_w = void_on ? vs.width : 0u;
++        p.void_h = void_on ? vs.height : 0u;
+ 
+         // Spec IDs: cam(0, unused), dist(1), median(2), accum(3),
+         // viewmat(4, unused), packed(5).
+diff --git a/src/backend/vulkan/shaders/rasterize_bwd.slang b/src/backend/vulkan/shaders/rasterize_bwd.slang
+index b98af99f..24a11e83 100644
+--- a/src/backend/vulkan/shaders/rasterize_bwd.slang
++++ b/src/backend/vulkan/shaders/rasterize_bwd.slang
+@@ -19,6 +19,7 @@
+ #include "screen.slang"
+ #include "atomic_float.slang"
+ #include "dist_spec.slang"
++#include "void_noise.slang"
+ 
+ [SpecializationConstant]
+ const int kCameraModel = 0;   // CameraModelType; 3dgut entry only
+@@ -97,15 +98,20 @@ void _rb_load_pixel_state(
+     float* out_rgb, float* out_depth, float* dist_rgb, float* dist_depth,
+     float* v_out_rgb, float* v_out_depth, float* v_dist_rgb,
+     float* v_dist_depth, float* awmap, float* v_median, uint state_flags,
+-    float v_dist_rgb_per_depth) {
+-    float T = inside ? render_Ts_img[gpix] : 0.0f;
+-    float v_T = inside ? v_render_Ts_img[gpix] : 0.0f;
++    float v_dist_rgb_per_depth, float T_void = -1.0f,
++    float3 void_c = float3(0.0f)) {
++    // A pixel whose ray reached a void (T_void >= 0) was reported covered;
++    // its real leftover light lit the void's colour (rasterize_fwd_2d).
++    const bool at_void = inside && T_void >= 0.0f;
++    float T = at_void ? T_void : (inside ? render_Ts_img[gpix] : 0.0f);
++    float v_T = (inside && !at_void) ? v_render_Ts_img[gpix] : 0.0f;
+     float4 v_c = float4(0.0f);
+     if (inside) {
+         v_c = float4(v_out_rgb[3 * image_pix], v_out_rgb[3 * image_pix + 1],
+                      v_out_rgb[3 * image_pix + 2],
+                      (state_flags & kRbDepthBound) != 0 ? v_out_depth[image_pix] : 0.0f);
+     }
++    if (at_void) v_T += dot(v_c.xyz, void_c);
+     // depth channel: convert dL/d(render depth) to dL/d(accumulated C).
+     {
+         float inv_alpha = 1.0f / max(1.0f - T, 1e-10f);
+@@ -130,6 +136,7 @@ void _rb_load_pixel_state(
+         if (inside) {
+             C = float4(out_rgb[3 * image_pix], out_rgb[3 * image_pix + 1],
+                        out_rgb[3 * image_pix + 2], out_depth[image_pix]);
++            if (at_void) C.xyz -= T * void_c;
+             Dv.w = dist_depth[image_pix];
+             v_d.w = v_dist_depth[image_pix];
+             if (kDistType == 2) {
+@@ -261,6 +268,9 @@ struct Raster2dBwdParams {  // via params ring
+     uint32_t macro_log2;
+     float v_dist_rgb_per_depth;
+     uint32_t state_flags;  // kRb*
++    float* void_buf;       // void_noise.slang layout; read when void_w != 0
++    uint32_t void_w;
++    uint32_t void_h;
+ };
+ 
+ struct Frag2d_ {
+@@ -366,12 +376,20 @@ void rasterize_bwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+         int bin = inside ? p.last_ids[img_off + gpix] : -1;
+         _rb_bin[pix] = bin;
+         bin_local = max(bin_local, bin);
++        float T_void = -1.0f;
++        float3 void_c = float3(0.0f);
++        if (p.void_w != 0u && inside &&
++            p.void_buf[void_map_index(image_id, p.void_w, p.void_h, uint(gx), uint(gy),
++                                      p.width, p.height)] < 1.0e38f) {
++            T_void = p.void_buf[void_light_index(p.I, p.void_w, p.void_h, img_off + gpix)];
++            void_c = void_noise_color(p.void_buf, image_id, uint(gx), uint(gy));
++        }
+         _rb_load_pixel_state(
+             pix, inside, img_off + gpix, p.render_Ts + img_off,
+             p.v_render_Ts + img_off, gpix, p.out_rgb, p.out_depth,
+             p.dist_rgb, p.dist_depth, p.v_out_rgb, p.v_out_depth,
+             p.v_dist_rgb, p.v_dist_depth, p.awmap, p.v_median,
+-            p.state_flags, p.v_dist_rgb_per_depth);
++            p.state_flags, p.v_dist_rgb_per_depth, T_void, void_c);
+     }
+     { uint prev; InterlockedMax(_rb_binmax, uint(bin_local + 1), prev); }
+     GroupMemoryBarrierWithGroupSync();
+diff --git a/src/backend/vulkan/shaders/rasterize_fwd.slang b/src/backend/vulkan/shaders/rasterize_fwd.slang
+index eb7e0811..e081cda3 100644
+--- a/src/backend/vulkan/shaders/rasterize_fwd.slang
++++ b/src/backend/vulkan/shaders/rasterize_fwd.slang
+@@ -31,6 +31,7 @@
+ 
+ #include "raster_common.slang"
+ #include "dist_spec.slang"
++#include "void_noise.slang"
+ 
+ [SpecializationConstant]
+ const int kCameraModel = 0;
+@@ -79,7 +80,7 @@ struct RasterFwd2dParams {
+     float* dist_rgb;     // [I,H,W,3], kDistType == 2 only
+     float* dist_depth;   // [I,H,W],   kDistType != 0 only
+     float* out_median;   // [I,H,W],   kOutputMedian only
+-    float* void_depth;   // [I,void_h,void_w], kVoidStop only
++    float* void_depth;   // void_noise.slang layout, kVoidStop only
+     uint32_t I;
+     uint32_t n_isects;
+     uint32_t width;
+@@ -125,11 +126,9 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+     // Voids block light: the ray ends where it enters a void, so splats
+     // behind it (the far wall) cannot cover for a see-through near wall.
+     float void_z = 3.0e38f;
+-    if (kVoidStop != 0 && inside) {
+-        uint vx = min(j * p.void_w / p.width, p.void_w - 1);
+-        uint vy = min(i * p.void_h / p.height, p.void_h - 1);
+-        void_z = p.void_depth[(image_id * p.void_h + vy) * p.void_w + vx];
+-    }
++    if (kVoidStop != 0 && inside)
++        void_z = p.void_depth[void_map_index(image_id, p.void_w, p.void_h, j, i,
++                                             p.width, p.height)];
+ 
+     // C = sum_j w_j c_j (raw) and S = sum_j w_j c_j^2 (RGB_D channels)
+     float3 pix_rgb = float3(0.0f);
+@@ -269,7 +268,13 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+     }
+ 
+     if (i < p.height && j < p.width) {
+-        p.out_T[pix_id_global] = T;
++        // A void is opaque and shows noise: the light left at it lands on the
++        // void's colour, and the background sees the pixel covered. The
++        // backward reads that light back from the void buffer.
++        const bool void_hit = kVoidStop != 0 && void_z < 1.0e38f;
++        p.out_T[pix_id_global] = void_hit ? 0.0f : T;
++        if (void_hit)
++            p.void_depth[void_light_index(p.I, p.void_w, p.void_h, pix_id_global)] = T;
+         if (kOutputMedian != 0)
+             p.out_median[pix_id_global] = median_depth;
+         // distortion: closed form D = W*S - C^2, evaluated before the depth
+@@ -288,6 +293,8 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+         float invW = 1.0f / max(1.0f - T, 1e-10f);
+         float out_depth = (kDistType != 0) ? exp(pix_depth * invW)
+                                            : pix_depth * invW;
++        if (void_hit)
++            pix_rgb += T * void_noise_color(p.void_depth, image_id, j, i);
+         p.out_rgb[3 * pix_id_global + 0] = pix_rgb.x;
+         p.out_rgb[3 * pix_id_global + 1] = pix_rgb.y;
+         p.out_rgb[3 * pix_id_global + 2] = pix_rgb.z;
+diff --git a/src/backend/vulkan/shaders/void_noise.slang b/src/backend/vulkan/shaders/void_noise.slang
+new file mode 100644
+index 00000000..0daee5ba
+--- /dev/null
++++ b/src/backend/vulkan/shaders/void_noise.slang
+@@ -0,0 +1,40 @@
++// The colour a void shows during training (backend/api/VoidStop.h): a cube
++// corner per 64 px cell, the grid shifted every step, so light that leaks
++// through a wall in front of a void lands on a colour no splat can predict.
++// `strength` blends it from grey, ramped in like the random backgrounds.
++
++[ForceInline]
++uint _void_mix(uint x) {
++    x ^= x >> 16; x *= 0x7feb352du;
++    x ^= x >> 15; x *= 0x846ca68bu;
++    x ^= x >> 16;
++    return x;
++}
++
++[ForceInline]
++float3 void_noise_color(float* buf, uint image_id, uint x, uint y) {
++    const uint seed = asuint(buf[0]);
++    const float strength = buf[1];
++    const uint cell = 64u;
++    uint cx = (x + _void_mix(seed * 2u + 1u) % cell) / cell;
++    uint cy = (y + _void_mix(seed * 2u + 7u) % cell) / cell;
++    uint h = _void_mix(cx * 2654435761u ^ cy * 40503u ^ (seed + image_id * 0x9e3779b9u));
++    float3 corner = float3((h & 1u) != 0u ? 0.5f : -0.5f, (h & 2u) != 0u ? 0.5f : -0.5f,
++                           (h & 4u) != 0u ? 0.5f : -0.5f);
++    return 0.5f + strength * corner;
++}
++
++// Layout of the void buffer: [0] the step's seed (bits), [1] the strength,
++// then the void depth maps [I, vh, vw], then the light left at each void
++// pixel [I, H, W] (void_light_index).
++[ForceInline]
++uint void_map_index(uint image_id, uint vw, uint vh, uint x, uint y, uint W, uint H) {
++    uint vx = min(x * vw / W, vw - 1u);
++    uint vy = min(y * vh / H, vh - 1u);
++    return 2u + (image_id * vh + vy) * vw + vx;
++}
++
++[ForceInline]
++uint void_light_index(uint I, uint vw, uint vh, uint image_pix) {
++    return 2u + I * vh * vw + image_pix;
++}
+diff --git a/src/engine/EngineConfig.h b/src/engine/EngineConfig.h
+index ba6d6b03..49746ac6 100644
+--- a/src/engine/EngineConfig.h
++++ b/src/engine/EngineConfig.h
+@@ -305,6 +305,7 @@ struct BackgroundStepConfig {
+     float    lr_dc           = 0.0f;
+     float    lr_sh           = 0.0f;
+     float    randomize_weight = 0.0f;
++    float    void_noise_weight = 1.0f;   // void colour strength (VoidStop.h), ramped like the noise
+     uint32_t seed             = 0;
+     bool     match_luminance  = false;   // randomized draw ^ per-image power
+ };
+diff --git a/src/engine/EngineForward.cpp b/src/engine/EngineForward.cpp
+index 494fd32f..37e8f802 100644
+--- a/src/engine/EngineForward.cpp
++++ b/src/engine/EngineForward.cpp
+@@ -416,10 +416,11 @@ void forward_3dgs(
+     DeviceTensor3D<float> render_median;
+ 
+     // Voids block light: armed by a training step for this forward only.
+-    if (engine().fwd.void_w > 0)
++    engine().fwd.void_active = engine().fwd.void_armed;
++    engine().fwd.void_armed = false;
++    if (engine().fwd.void_active)
+         backend::void_stop() = {(uint64_t)engine().fwd.void_depth.data_ptr(),
+                                 engine().fwd.void_w, engine().fwd.void_h};
+-    engine().fwd.void_w = engine().fwd.void_h = 0;
+ 
+     if (primitive == "3dgs") {
+         auto [r, rTs, lids, dist, med] = rasterize_to_pixels_3dgs_fwd(
+diff --git a/src/engine/EngineLoss.cpp b/src/engine/EngineLoss.cpp
+index 4698f802..0343328c 100644
+--- a/src/engine/EngineLoss.cpp
++++ b/src/engine/EngineLoss.cpp
+@@ -1,5 +1,6 @@
+ // Engine loss + combined backward pass.
+ 
++#include "backend/api/VoidStop.h"
+ #include "engine/Engine.h"
+ #include "engine/EngineCommon.h"
+ #include "engine/EngineInternal.h"
+@@ -224,6 +225,10 @@ static void _engine_raster_proj_backward(
+ 
+     std::vector<DeviceTensorFloatND> v_splats_w_out, v_splats_s_out;
+ 
++    // The training forward's voids, for its backward only.
++    if (engine().fwd.void_active)
++        backend::void_stop_bwd() = {(uint64_t)engine().fwd.void_depth.data_ptr(),
++                                    engine().fwd.void_w, engine().fwd.void_h};
+     if (engine().primitive == "3dgs" || engine().primitive == "mip") {
+         auto [vw, vs, accum_weight] = rasterize_to_pixels_3dgs_bwd(
+             engine().cur_num_splats,
+diff --git a/src/engine/EngineState.h b/src/engine/EngineState.h
+index 2ee9cac9..99f43041 100644
+--- a/src/engine/EngineState.h
++++ b/src/engine/EngineState.h
+@@ -147,10 +147,12 @@ struct ForwardCache {
+     // out of the intersections, so the raster gets an empty range for them.
+     // Empty unless a training step asked for it (engine_set_tile_skip_mask).
+     DeviceVector<int32_t>             tile_active;
+-    // [C, void_h, void_w] camera depth where each ray enters a void ("voids
+-    // block light"); set by a training step for its forward only.
++    // "Voids block light" (backend/api/VoidStop.h): seed, the [C, void_h,
++    // void_w] void depth maps and the light left at each void pixel. Armed by
++    // a training step for its next forward; active for that forward's backward.
+     DeviceVector<float>               void_depth;
+     uint32_t                          void_w = 0, void_h = 0;
++    bool                              void_armed = false, void_active = false;
+     DeviceTensor3D<float>             render_Ts;
+     DeviceTensor3D<float>             render_median; // [C,H,W] median depth, empty if not requested
+     DeviceTensor3D<int32_t>           last_ids;
+diff --git a/src/engine/EngineTrainStep.cpp b/src/engine/EngineTrainStep.cpp
+index a720b89f..d17b7ba4 100644
+--- a/src/engine/EngineTrainStep.cpp
++++ b/src/engine/EngineTrainStep.cpp
+@@ -10,7 +10,9 @@
+ #include "engine/EngineState.h"
+ #include "shaders/screen_layout.h"
+ 
++#include <algorithm>
+ #include <cstdio>
++#include <cstring>
+ #include <map>
+ #include <stdexcept>
+ #include <string>
+@@ -148,11 +150,12 @@ void engine_set_void_stop_provider(VoidStopProvider provider) {
+     _void_stop_provider() = std::move(provider);
+ }
+ 
+-// Asks the provider for this batch's void depths and uploads them; forward_3dgs
+-// hands them to the raster and clears them, so only this forward stops rays.
+-static void _prepare_void_stop() {
++// Asks the provider for this batch's void depths and uploads them with the
++// step's seed (layout: shaders/void_noise.slang); forward_3dgs hands them to
++// the raster, and the loss backward to the raster backward.
++static void _prepare_void_stop(int step, float strength) {
+     auto& fwd = engine().fwd;
+-    fwd.void_w = fwd.void_h = 0;
++    fwd.void_armed = false;
+     const VoidStopProvider& prov = _void_stop_provider();
+     const CameraTable& cam = engine().camera;
+     if (!prov || cam.num <= 0) return;
+@@ -177,11 +180,18 @@ static void _prepare_void_stop() {
+     std::vector<float> map;
+     int mw = 0, mh = 0;
+     if (!prov(c, map, mw, mh) || mw <= 0 || mh <= 0 || map.size() != n * mw * mh) return;
+-    fwd.void_depth.resize(PoolSlot::RenderVoidDepth, (int64_t)map.size());
+-    backend::memcpy_sync(fwd.void_depth.data_ptr(), map.data(), map.size() * sizeof(float),
++    const size_t light = n * (size_t)cam.width * (size_t)cam.height;
++    fwd.void_depth.resize(PoolSlot::RenderVoidDepth, (int64_t)(2 + map.size() + light));
++    const uint32_t seed = (uint32_t)step * 0x9e3779b9u + 0x7f4a7c15u;
++    float head[2] = {0.0f, std::clamp(strength, 0.0f, 1.0f)};
++    std::memcpy(&head[0], &seed, sizeof seed);
++    backend::memcpy_sync(fwd.void_depth.data_ptr(), head, sizeof head,
++                         backend::MemcpyKind::HostToDevice);
++    backend::memcpy_sync(fwd.void_depth.data_ptr() + 2, map.data(), map.size() * sizeof(float),
+                          backend::MemcpyKind::HostToDevice);
+     fwd.void_w = (uint32_t)mw;
+     fwd.void_h = (uint32_t)mh;
++    fwd.void_armed = true;
+ }
+ 
+ static std::map<std::string, float> _engine_step_fwd_bwd_only(
+@@ -263,7 +273,7 @@ static std::map<std::string, float> _engine_step_fwd_bwd_only(
+ 
+     {
+         SplatStageTimer stage_timer;
+-        _prepare_void_stop();
++        _prepare_void_stop(step, cfg.background.void_noise_weight);
+         forward_3dgs(primitive, sh_degree, packed, /*output_median=*/false, (int)dist_type);
+     }
+     _engine_step_image_stages(bilagrid_cam_indices);
 -- 
 2.47.1
 
